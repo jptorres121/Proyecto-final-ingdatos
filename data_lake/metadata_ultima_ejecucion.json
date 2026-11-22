@@ -1,9 +1,9 @@
 {
   "pipeline": "Spotify Data Lakehouse",
-  "ejecutado_utc": "2026-11-21T21:04:58.872383+00:00",
-  "filas_bronze": 2000,
-  "filas_silver": 2000,
-  "filas_gold": 320,
+  "ejecutado_utc": "2026-11-22T03:53:39.166892+00:00",
+  "filas_bronze": 50,
+  "filas_silver": 48,
+  "filas_gold": 16,
   "silver_path": "C:\\Users\\juanp\\Downloads\\ProyectoINGDATOS-API-dashboard\\ProyectoINGDATOS-master\\data_lake\\silver\\catalogo_limpio.parquet",
   "gold_path": "C:\\Users\\juanp\\Downloads\\ProyectoINGDATOS-API-dashboard\\ProyectoINGDATOS-master\\data_lake\\gold\\tracks_por_artista_genero.parquet"
 }

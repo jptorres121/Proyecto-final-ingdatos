@@ -26,13 +26,23 @@ SILVER = DATA / "silver"
 GOLD = DATA / "gold"
 
 
+def _normalizar_tipos(df: pd.DataFrame) -> pd.DataFrame:
+    """Evita columnas con tipos mezclados (p. ej. fechas como texto y como número), que Parquet no admite."""
+    df = df.copy()
+    for c in df.columns:
+        if df[c].dtype == object and df[c].dropna().map(type).nunique() > 1:
+            df[c] = df[c].map(lambda v: v if pd.isna(v) else str(v))
+    return df
+
+
 def _guardar_tabla(df: pd.DataFrame, ruta_sin_extension: Path) -> Path:
     """Guarda Parquet si hay motor instalado; de lo contrario usa CSV."""
     ruta_sin_extension.parent.mkdir(parents=True, exist_ok=True)
+    df = _normalizar_tipos(df)
     try:
         destino = ruta_sin_extension.with_suffix(".parquet")
         df.to_parquet(destino, index=False)
-    except (ImportError, ModuleNotFoundError, ValueError):
+    except (ImportError, ModuleNotFoundError, ValueError, TypeError):
         destino = ruta_sin_extension.with_suffix(".csv")
         df.to_csv(destino, index=False, encoding="utf-8-sig")
     return destino
@@ -43,7 +53,7 @@ def _leer_tabla(carpeta: Path) -> pd.DataFrame:
     if not archivos:
         raise FileNotFoundError(f"No hay datos en {carpeta}. Ejecuta primero la extracción o el ETL.")
     partes = [pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p) for p in archivos]
-    return pd.concat(partes, ignore_index=True)
+    return _normalizar_tipos(pd.concat(partes, ignore_index=True))
 
 
 def extraer_api_itunes(termino: str = "Coldplay", limite: int = 50) -> pd.DataFrame:
@@ -79,6 +89,7 @@ def ejecutar_etl(df_origen: pd.DataFrame | None = None) -> tuple[pd.DataFrame, p
     """ETL didáctico: Bronze (crudo), Silver (limpio) y Gold (agregado)."""
     if df_origen is None:
         df_origen = _leer_tabla(BRONZE)
+    df_origen = _normalizar_tipos(df_origen)
     BRONZE.mkdir(parents=True, exist_ok=True)
     SILVER.mkdir(parents=True, exist_ok=True)
     GOLD.mkdir(parents=True, exist_ok=True)
@@ -164,16 +175,35 @@ def construir_modelos_dimensionales(df: pd.DataFrame) -> dict[str, pd.DataFrame]
     return tablas
 
 
-def ejecutar_spark_batch():
-    """Procesa los datos Silver con Spark batch (opcional; requiere Java y PySpark)."""
+def _spark_disponible() -> tuple[bool, str]:
+    """¿Puede arrancar Spark en este equipo? En Windows necesita HADOOP_HOME con bin\\winutils.exe.
+    Si existe la carpeta hadoop/bin dentro del proyecto, se configura sola."""
     try:
-        from pyspark.sql import SparkSession
-        from pyspark.sql.functions import count, col
-    except ImportError as exc:
-        raise RuntimeError("Instala pyspark y Java para ejecutar Spark batch.") from exc
-    archivos = list(SILVER.glob("*.parquet")) + list(SILVER.glob("*.csv"))
-    if not archivos:
-        raise FileNotFoundError("No hay datos Silver. Ejecuta primero el ETL.")
+        import pyspark  # noqa: F401
+    except ImportError:
+        return False, "pyspark no está instalado."
+    if os.name == "nt":
+        local = BASE / "hadoop"
+        if (local / "bin" / "winutils.exe").exists() and not os.environ.get("HADOOP_HOME"):
+            os.environ["HADOOP_HOME"] = str(local)
+            os.environ["PATH"] = str(local / "bin") + os.pathsep + os.environ.get("PATH", "")
+        home = os.environ.get("HADOOP_HOME")
+        if not home or not (Path(home) / "bin" / "winutils.exe").exists():
+            return False, ("En Windows Spark necesita HADOOP_HOME con bin\\winutils.exe y hadoop.dll "
+                           "(no está configurado en este equipo).")
+    return True, ""
+
+
+def _es_error_entorno_spark(exc: Exception) -> bool:
+    t = str(exc)
+    return isinstance(exc, (ImportError, RuntimeError)) or any(
+        k in t for k in ("HADOOP_HOME", "hadoop.home.dir", "winutils", "UnsatisfiedLinkError", "NativeIO",
+                         "JAVA_HOME", "Java gateway"))
+
+
+def _spark_batch_real(archivos):
+    from pyspark.sql import SparkSession
+    from pyspark.sql.functions import count, col
     spark = SparkSession.builder.appName("SpotifyBatchETL").master("local[*]").getOrCreate()
     try:
         fuente = str(archivos[0])
@@ -187,6 +217,33 @@ def ejecutar_spark_batch():
         print("Resultado Spark batch guardado en:", salida)
     finally:
         spark.stop()
+
+
+def ejecutar_spark_batch(usar_spark: bool = True) -> tuple[str, str]:
+    """Procesa Silver con Spark batch. Si Spark no puede arrancar (p. ej. Windows sin winutils),
+    calcula lo mismo al instante con Pandas. Devuelve (motor, motivo)."""
+    archivos = list(SILVER.glob("*.parquet")) + list(SILVER.glob("*.csv"))
+    if not archivos:
+        raise FileNotFoundError("No hay datos Silver. Ejecuta primero el ETL.")
+    ok, motivo = _spark_disponible() if usar_spark else (False, "Spark desactivado por el usuario.")
+    if ok:
+        try:
+            _spark_batch_real(archivos)
+            return "spark", ""
+        except Exception as exc:
+            if not _es_error_entorno_spark(exc):
+                raise
+            motivo = "Spark no pudo arrancar en este equipo (Hadoop/Java)."
+    print(f"[Motor Pandas] {motivo} Se calcula el mismo groupBy con Pandas.")
+    df = _leer_tabla(SILVER)
+    if "nombre_artista" not in df.columns:
+        raise ValueError("Silver no contiene nombre_artista.")
+    res = (df.groupby("nombre_artista").size().rename("cantidad_tracks").reset_index()
+           .sort_values("cantidad_tracks", ascending=False))
+    print(res.head(20).to_string(index=False))
+    salida = _guardar_tabla(res, GOLD / "spark_batch_artistas")
+    print("Resultado guardado en:", salida)
+    return "python", motivo
 
 
 def crear_eventos_demo() -> Path:
@@ -210,15 +267,10 @@ def crear_eventos_demo() -> Path:
     return entrada
 
 
-def spark_streaming_ventanas():
-    """Ventanas por tiempo de evento, watermark, checkpoint y salida Parquet."""
-    try:
-        from pyspark.sql import SparkSession
-        from pyspark.sql.functions import col, window, sum as sum_, current_timestamp
-        from pyspark.sql.types import StructType, StructField, StringType, LongType
-    except ImportError as exc:
-        raise RuntimeError("Instala pyspark y Java para ejecutar Structured Streaming.") from exc
-    entrada = crear_eventos_demo()
+def _spark_streaming_real(entrada):
+    from pyspark.sql import SparkSession
+    from pyspark.sql.functions import col, window, sum as sum_, current_timestamp
+    from pyspark.sql.types import StructType, StructField, StringType, LongType
     salida = DATA / "stream_output" / "ventanas_artista"
     checkpoint = DATA / "checkpoints" / "ventanas_artista"
     schema = StructType([StructField("evento_id", StringType()), StructField("artista", StringType()),
@@ -238,11 +290,53 @@ def spark_streaming_ventanas():
         consulta.awaitTermination()
         print("Ventanas procesadas. Salida:", salida)
         print("Checkpoint:", checkpoint)
-        print("Event time = momento declarado del evento; processing time = momento de procesamiento.")
-        print("Watermark de 10 min = umbral para gestionar eventos tardíos y limpiar estado; no recupera por sí solo eventos descartados.")
-        print("El checkpoint permite a Spark recuperar progreso/estado compatible al reiniciar la consulta.")
     finally:
         spark.stop()
+
+
+def _streaming_ventanas_python(entrada):
+    """Mismo cálculo que Structured Streaming (ventanas de 5 min, watermark de 10 min) con Pandas."""
+    frames = [pd.read_json(f, lines=True) for f in sorted(Path(entrada).glob("*.json"))]
+    ev = pd.concat(frames, ignore_index=True)
+    ev["event_time"] = pd.to_datetime(ev["event_time"], utc=True)
+    watermark = ev["event_time"].max() - pd.Timedelta(minutes=10)
+    ev["window_start"] = ev["event_time"].dt.floor("5min")
+    ev["window_end"] = ev["window_start"] + pd.Timedelta(minutes=5)
+    tardios = ev[ev["window_end"] <= watermark]
+    validos = ev[ev["window_end"] > watermark]
+    res = (validos.groupby(["window_start", "window_end", "artista"], as_index=False)
+           .agg(reproducciones_ventana=("reproducciones", "sum"), eventos=("evento_id", "count")))
+    res["window_start"] = res["window_start"].dt.strftime("%Y-%m-%d %H:%M")
+    res["window_end"] = res["window_end"].dt.strftime("%Y-%m-%d %H:%M")
+    res["estado"] = "abierta (Spark la emitiría al pasar el watermark)"
+    salida = DATA / "stream_output" / "ventanas_artista"
+    _guardar_tabla(res, salida / "ventanas_python")
+    print(f"Watermark = mayor event time - 10 min = {watermark:%H:%M:%S} UTC")
+    print(res.to_string(index=False))
+    print(f"{len(tardios)} evento(s) descartado(s) por caer en ventanas ya cerradas por el watermark: "
+          f"{', '.join(tardios['evento_id'].tolist()) or 'ninguno'}")
+    return res, tardios
+
+
+def spark_streaming_ventanas(usar_spark: bool = True) -> tuple[str, str]:
+    """Ventanas por tiempo de evento, watermark y salida Parquet.
+    Usa Spark si puede arrancar; si no (p. ej. Windows sin winutils) calcula lo mismo al instante con
+    Pandas. Devuelve (motor, motivo)."""
+    entrada = crear_eventos_demo()
+    ok, motivo = _spark_disponible() if usar_spark else (False, "Spark desactivado por el usuario.")
+    if ok:
+        try:
+            _spark_streaming_real(entrada)
+            print("Event time = momento declarado del evento; processing time = momento de procesamiento.")
+            print("Watermark de 10 min = umbral para gestionar eventos tardíos y limpiar estado.")
+            return "spark", ""
+        except Exception as exc:
+            if not _es_error_entorno_spark(exc):
+                raise
+            motivo = "Spark no pudo arrancar en este equipo (Hadoop/Java)."
+    print(f"[Motor Pandas] {motivo} Se calcula lo mismo con Pandas.")
+    _streaming_ventanas_python(entrada)
+    return "python", motivo
 
 
 def menu():

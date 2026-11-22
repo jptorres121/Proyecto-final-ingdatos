@@ -244,7 +244,7 @@ def _ejecutar_spark(titulo, lotes, esquema, consultas):
     except ImportError:
         print("\nFalta PySpark. Instálalo con: pip install pyspark")
         print("(Spark también necesita Java instalado.)")
-        return
+        return False
 
     carpeta = tempfile.mkdtemp(prefix="stream_entrada_")
     spark = None
@@ -284,9 +284,11 @@ def _ejecutar_spark(titulo, lotes, esquema, consultas):
                     tabla = tabla.sort_values(list(tabla.columns)[0]).reset_index(drop=True)
                 print(f"\n[{nombre}]  (modo de salida: {modo}, {len(tabla)} filas)")
                 print(tabla.to_string(index=False) if len(tabla) else "  (sin resultados todavía)")
+        exito = True
     except Exception as e:
-        print(f"\nNo se pudo ejecutar Spark: {e}")
-        print("Revisa que Java esté instalado y que la versión de PySpark sea compatible.")
+        exito = False
+        primera = (str(e).strip().splitlines() or [""])[0][:200]
+        print(f"\nNo se pudo ejecutar Spark: {primera}")
     finally:
         for q in activas:
             try:
@@ -296,6 +298,37 @@ def _ejecutar_spark(titulo, lotes, esquema, consultas):
         if spark is not None:
             spark.stop()   # libera la JVM y su memoria
         shutil.rmtree(carpeta, ignore_errors=True)
+    return exito
+
+
+def _spark_listo():
+    """(ok, motivo): ¿puede arrancar Spark aquí? En Windows exige HADOOP_HOME con winutils."""
+    try:
+        import pipeline_avanzado
+        return pipeline_avanzado._spark_disponible()
+    except Exception as e:
+        return False, str(e)
+
+
+def _emular_con_pandas(lotes, umbral):
+    """Mismas 3 consultas de Structured Streaming, calculadas con Pandas lote a lote (resultado inmediato)."""
+    vistos = []
+    for numero, lote in enumerate(lotes, start=1):
+        vistos.extend(lote)
+        acum = pd.DataFrame(vistos)
+        print(f"\n----- Llegó el archivo {numero} de {len(lotes)} ({len(lote)} eventos) -----")
+        destacados = acum[acum["reproducciones"] > umbral]
+        t1 = destacados[["evento_id", "cancion", "artista", "genero", "reproducciones", "evento_ts"]]
+        t2 = (destacados.groupby("artista").size().rename("eventos_destacados").reset_index()
+              .sort_values("artista"))
+        unicos = acum.drop_duplicates(["evento_id", "evento_ts"])      # dropDuplicates con watermark
+        t3 = (unicos.groupby("artista").agg(total_reproducciones=("reproducciones", "sum"),
+                                            eventos_unicos=("evento_id", "count")).reset_index())
+        for nombre, tabla, modo in [("ejemplo1_filtro", t1, "append"),
+                                    ("ejemplo2_conteo_por_artista", t2, "complete"),
+                                    ("extra_total_por_artista_sin_duplicados", t3, "complete")]:
+            print(f"\n[{nombre}]  (modo de salida: {modo}, {len(tabla)} filas)")
+            print(tabla.to_string(index=False) if len(tabla) else "  (sin resultados todavía)")
 
 
 def spark_streaming_spotify(eventos):
@@ -346,7 +379,15 @@ Consultas:
   ejemplo2_conteo_por_artista -> groupBy('artista').count() sobre los filtrados, modo complete
   extra_total_por_artista_sin_duplicados -> withWatermark + dropDuplicates y suma por artista, modo complete
   (los agregados mantienen estado; el watermark evita que el estado de deduplicación crezca sin fin)""")
-    _ejecutar_spark("SpotifyStreaming", _dividir(eventos, 3), ESQUEMA_SPOTIFY, consultas)
+    lotes = _dividir(eventos, 3)
+    ok, motivo = _spark_listo()
+    if ok:
+        if _ejecutar_spark("SpotifyStreaming", lotes, ESQUEMA_SPOTIFY, consultas):
+            return
+        motivo = "Spark no pudo arrancar en este equipo (Hadoop/Java)."
+    print(f"\n[Motor Pandas] {motivo}")
+    print("Se calculan las mismas 3 consultas con Pandas, lote a lote (mismo resultado, inmediato).")
+    _emular_con_pandas(lotes, umbral)
 
 
 def leer_desde_kafka(spark, esquema, servidor="localhost:9092", topico="spotify.reproducciones"):
